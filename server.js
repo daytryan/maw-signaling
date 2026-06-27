@@ -23,7 +23,26 @@
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 9000;
-const wss = new WebSocketServer({ port: PORT });
+// Cap a single frame at 64KB — SDP/ICE messages are small, so anything larger is abuse.
+// The ws library closes the connection (1009) if a peer exceeds this.
+const wss = new WebSocketServer({ port: PORT, maxPayload: 64 * 1024 });
+
+// ── Abuse limits ────────────────────────────────────────────────────────────
+// This server is public and unauthenticated, so bound the resources a single
+// source can consume: it can't open unlimited sockets (DoS / room-code brute force
+// across connections) and the process can't be made to hold unlimited rooms.
+const MAX_CONNS_PER_IP = 25;
+const MAX_ROOMS = 10000;
+const MAX_JOINS_PER_CONN = 60;        // a legit guest joins one room; this caps code-guessing
+const connsByIp = new Map();          // ip -> open socket count
+
+function clientIp(req) {
+  // Behind Render/Railway/Fly the real client is in x-forwarded-for; fall back to the
+  // socket address for direct/local connections.
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return String(xff).split(',')[0].trim();
+  return req.socket?.remoteAddress || 'unknown';
+}
 
 wss.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
@@ -45,12 +64,28 @@ function normRoom(room) {
   return String(room || '').trim().toUpperCase();
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  // Per-IP connection cap — refuse (don't just drop) once a source is over budget.
+  const ip = clientIp(req);
+  const open = connsByIp.get(ip) || 0;
+  if (open >= MAX_CONNS_PER_IP) { try { ws.close(1013, 'too-many'); } catch {} return; }
+  connsByIp.set(ip, open + 1);
+
   ws.id = String(nextId++);
+  ws.ip = ip;
   ws.room = null;
   ws.role = null;
+  ws._rlStart = 0;
+  ws._rlCount = 0;
+  ws._joins = 0;
 
   ws.on('message', (raw) => {
+    // Per-connection rate limit: legitimate signaling is a handful of messages per peer.
+    // Drop anything past ~120/sec (cheap) so a misbehaving client can't flood the server.
+    const now = Date.now();
+    if (now - ws._rlStart > 1000) { ws._rlStart = now; ws._rlCount = 0; }
+    if (++ws._rlCount > 120) return;
+
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
@@ -62,6 +97,10 @@ wss.on('connection', (ws) => {
         if (existing && existing.host && existing.host.readyState === 1) {
           return send(ws, { type: 'error', reason: 'room-taken' });
         }
+        // Bound total rooms so the process can't be made to hold unlimited state.
+        if (!existing && rooms.size >= MAX_ROOMS) {
+          return send(ws, { type: 'error', reason: 'server-full' });
+        }
         const room = existing || { host: null, peers: new Map() };
         room.host = ws;
         rooms.set(code, room);
@@ -72,6 +111,9 @@ wss.on('connection', (ws) => {
       }
 
       case 'join': {
+        // Cap join attempts per connection so a single socket can't sweep the room-code
+        // keyspace (paired with the per-IP connection cap, this bounds brute force).
+        if (++ws._joins > MAX_JOINS_PER_CONN) { try { ws.close(1013, 'too-many-joins'); } catch {} return; }
         const code = normRoom(msg.room);
         const room = rooms.get(code);
         if (!room || !room.host || room.host.readyState !== 1) {
@@ -88,9 +130,15 @@ wss.on('connection', (ws) => {
       case 'signal': {
         const room = rooms.get(ws.room);
         if (!room) return;
+        // Enforce the star topology: a guest may only signal its host, and the host may
+        // only signal its own guests. Stops a guest from relaying crafted SDP/ICE to
+        // other guests (forcing unsolicited peer connections that bypass host approval).
         let target = null;
-        if (room.host && room.host.id === msg.to) target = room.host;
-        else target = room.peers.get(msg.to);
+        if (ws.role === 'guest') {
+          if (room.host && room.host.id === msg.to) target = room.host;
+        } else if (ws.role === 'host' && room.host === ws) {
+          target = room.peers.get(msg.to) || null;
+        }
         send(target, { type: 'signal', from: ws.id, data: msg.data });
         break;
       }
@@ -98,6 +146,10 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    // Release this socket's slot in the per-IP budget.
+    const n = (connsByIp.get(ws.ip) || 1) - 1;
+    if (n <= 0) connsByIp.delete(ws.ip); else connsByIp.set(ws.ip, n);
+
     const room = rooms.get(ws.room);
     if (!room) return;
     if (ws.role === 'host' && room.host === ws) {
