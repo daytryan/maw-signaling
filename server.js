@@ -36,11 +36,17 @@ const MAX_ROOMS = 10000;
 const MAX_JOINS_PER_CONN = 60;        // a legit guest joins one room; this caps code-guessing
 const connsByIp = new Map();          // ip -> open socket count
 
+// Validate that an extracted IP is actually an IP (not a crafted header).
+const IP_RE = /^([\d]{1,3}\.){3}[\d]{1,3}$|^[0-9a-fA-F:]{2,39}$/;
 function clientIp(req) {
   // Behind Render/Railway/Fly the real client is in x-forwarded-for; fall back to the
   // socket address for direct/local connections.
   const xff = req.headers['x-forwarded-for'];
-  if (xff) return String(xff).split(',')[0].trim();
+  if (xff) {
+    const candidate = String(xff).split(',')[0].trim();
+    // Only trust if it looks like a real IP address, not a crafted value used to bypass rate limits.
+    if (IP_RE.test(candidate)) return candidate;
+  }
   return req.socket?.remoteAddress || 'unknown';
 }
 
@@ -77,6 +83,7 @@ wss.on('connection', (ws, req) => {
   ws.role = null;
   ws._rlStart = 0;
   ws._rlCount = 0;
+  ws._rlDrops = 0;
   ws._joins = 0;
 
   ws.on('message', (raw) => {
@@ -84,7 +91,11 @@ wss.on('connection', (ws, req) => {
     // Drop anything past ~120/sec (cheap) so a misbehaving client can't flood the server.
     const now = Date.now();
     if (now - ws._rlStart > 1000) { ws._rlStart = now; ws._rlCount = 0; }
-    if (++ws._rlCount > 120) return;
+    if (++ws._rlCount > 120) {
+      // After 600 excess messages (5 s of sustained abuse), terminate the connection.
+      if (++ws._rlDrops > 600) { try { ws.close(1008, 'rate-exceeded'); } catch {} }
+      return;
+    }
 
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
